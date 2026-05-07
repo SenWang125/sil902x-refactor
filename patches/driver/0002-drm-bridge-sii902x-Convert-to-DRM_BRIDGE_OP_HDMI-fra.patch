@@ -1,7 +1,7 @@
 From 5a6c3a8cd7243661f1c816cf9e8c9f4db8d18c7d Mon Sep 17 00:00:00 2001
 From: Sen Wang <sen@ti.com>
 Date: Fri, 24 Apr 2026 16:33:16 -0500
-Subject: [PATCH 2/3] drm/bridge: sii902x: Convert to DRM_BRIDGE_OP_HDMI
+Subject: [PATCH 2/4] drm/bridge: sii902x: Convert to DRM_BRIDGE_OP_HDMI
  framework
 
 Convert the SiI9022 HDMI bridge driver from the legacy hdmi-codec

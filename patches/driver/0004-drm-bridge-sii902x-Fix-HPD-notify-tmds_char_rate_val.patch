@@ -1,0 +1,140 @@
+From 46c20467ae90e317f62263774e015b9d25c859d2 Mon Sep 17 00:00:00 2001
+From: Sen Wang <sen@ti.com>
+Date: Thu, 7 May 2026 16:17:42 -0500
+Subject: [PATCH 4/4] drm/bridge: sii902x: Fix HPD notify,
+ tmds_char_rate_valid, and D3 audio restore
+
+- Use drm_bridge_hpd_notify() exclusively in IRQ handler; remove legacy
+  drm_helper_hpd_irq_event() call that bypassed the HDMI hotplug path
+  and left connector ELD unpopulated.
+- sii902x_bridge_hdmi_tmds_char_rate_valid: delegate to
+  sii902x_bridge_mode_valid() to avoid duplicating clock range checks.
+- D3 Cold atomic_disable: save audio config register (BYTE2) before chip
+  reset.
+- D3 Cold atomic_enable: restore I2S FIFO sequence and audio config
+  register on resume to recover audio output after chip reset.
+---
+ drivers/gpu/drm/bridge/sii902x.c | 60 ++++++++++++++++++--------------
+ 1 file changed, 33 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/gpu/drm/bridge/sii902x.c b/drivers/gpu/drm/bridge/sii902x.c
+index 081b1dd29ff8..913336c951b4 100644
+--- a/drivers/gpu/drm/bridge/sii902x.c
++++ b/drivers/gpu/drm/bridge/sii902x.c
+@@ -181,6 +181,7 @@ struct sii902x {
+ 	struct i2c_mux_core *i2cmux;
+ 	struct device_link *link;
+ 	unsigned int ctx_interrupt;
++	unsigned int ctx_audio_config;
+ 	bool d3_suspended;
+ 	u32 bus_width;
+ 
+@@ -360,8 +361,10 @@ static void sii902x_bridge_atomic_disable(struct drm_bridge *bridge,
+ {
+ 	struct sii902x *sii902x = bridge_to_sii902x(bridge);
+ 
+-	/* Save interrupt enable state before D3 Cold entry. */
++	/* Save state before D3 Cold chip reset. */
+ 	regmap_read(sii902x->regmap, SII902X_INT_ENABLE, &sii902x->ctx_interrupt);
++	regmap_read(sii902x->regmap, SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
++		    &sii902x->ctx_audio_config);
+ 
+ 	mutex_lock(&sii902x->mutex);
+ 
+@@ -399,12 +402,27 @@ static void sii902x_bridge_atomic_enable(struct drm_bridge *bridge,
+ 
+ 	/* Full hardware init required after D3. */
+ 	if (sii902x->d3_suspended) {
++		int i;
++
+ 		sii902x->d3_suspended = false;
+ 		sii902x_reset(sii902x);
+ 		regmap_write(sii902x->regmap, SII902X_REG_TPI_RQB, 0x0);
+ 		regmap_write(sii902x->regmap, SII902X_INT_ENABLE,
+ 			     sii902x->ctx_interrupt);
+ 		sii902x_clear_interrupts(sii902x);
++
++		/* Restore audio hardware state lost on chip reset. */
++		if (sii902x->ctx_audio_config) {
++			for (i = 0; i < ARRAY_SIZE(sii902x->audio.i2s_fifo_sequence) &&
++				    sii902x->audio.i2s_fifo_sequence[i]; i++)
++				regmap_write(sii902x->regmap,
++					     SII902X_TPI_I2S_ENABLE_MAPPING_REG,
++					     sii902x->audio.i2s_fifo_sequence[i]);
++			sii902x_audio_decode_l0(sii902x);
++			regmap_write(sii902x->regmap,
++				     SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
++				     sii902x->ctx_audio_config);
++		}
+ 	}
+ 
+ 	connector = drm_atomic_get_new_connector_for_encoder(state, bridge->encoder);
+@@ -655,13 +673,7 @@ sii902x_bridge_hdmi_tmds_char_rate_valid(const struct drm_bridge *bridge,
+ 					 const struct drm_display_mode *mode,
+ 					 unsigned long long tmds_rate)
+ {
+-	if (mode->clock < SII902X_MIN_PIXEL_CLOCK_KHZ)
+-		return MODE_CLOCK_LOW;
+-
+-	if (mode->clock > SII902X_MAX_PIXEL_CLOCK_KHZ)
+-		return MODE_CLOCK_HIGH;
+-
+-	return MODE_OK;
++	return sii902x_bridge_mode_valid((struct drm_bridge *)bridge, NULL, mode);
+ }
+ 
+ /* HDMI infoframe callbacks — framework packs, driver writes to hardware. */
+@@ -1197,13 +1209,11 @@ static irqreturn_t sii902x_interrupt(int irq, void *data)
+ 	status = sii902x_clear_interrupts(sii902x);
+ 	mutex_unlock(&sii902x->mutex);
+ 
+-	if ((status & SII902X_HOTPLUG_EVENT) && sii902x->bridge.dev) {
+-		drm_helper_hpd_irq_event(sii902x->bridge.dev);
++	if ((status & SII902X_HOTPLUG_EVENT) && sii902x->bridge.dev)
+ 		drm_bridge_hpd_notify(&sii902x->bridge,
+ 				      (status & SII902X_PLUGGED_STATUS)
+ 					? connector_status_connected
+ 					: connector_status_disconnected);
+-	}
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -1378,23 +1388,19 @@ static int sii902x_audio_init(struct sii902x *sii902x, struct device *dev)
+ 	sii902x->bridge.hdmi_audio_max_i2s_playback_channels = 2 * num_lanes;
+ 	sii902x->bridge.hdmi_audio_dai_port = SII902X_AUDIO_PORT_INDEX;
+ 
+-	{
+-		struct hdmi_codec_pdata codec_data = {
+-			.ops = &sii902x_audio_codec_ops,
+-			.i2s = 1,
+-			.spdif = 0,
+-			.max_i2s_channels = 2 * num_lanes,
+-			.no_capture_mute = 1,
+-		};
+-
+-		sii902x->audio.pdev = platform_device_register_data(
+-			dev, HDMI_CODEC_DRV_NAME, PLATFORM_DEVID_AUTO,
+-			&codec_data, sizeof(codec_data));
+-		if (IS_ERR(sii902x->audio.pdev))
+-			return PTR_ERR(sii902x->audio.pdev);
+-	}
++	struct hdmi_codec_pdata codec_data = {
++		.ops = &sii902x_audio_codec_ops,
++		.i2s = 1,
++		.spdif = 0,
++		.max_i2s_channels = 2 * num_lanes,
++		.no_capture_mute = 1,
++	};
+ 
+-	return 0;
++	sii902x->audio.pdev = platform_device_register_data(
++		dev, HDMI_CODEC_DRV_NAME, PLATFORM_DEVID_AUTO,
++		&codec_data, sizeof(codec_data));
++
++	return PTR_ERR_OR_ZERO(sii902x->audio.pdev);
+ }
+ 
+ static int sii902x_init(struct sii902x *sii902x)
+-- 
+2.43.0
+

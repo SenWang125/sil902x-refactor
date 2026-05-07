@@ -1,7 +1,7 @@
 From 605f46fea35e9643be881a9e489e1c6587df94a7 Mon Sep 17 00:00:00 2001
 From: Sen Wang <sen@ti.com>
 Date: Fri, 24 Apr 2026 16:33:56 -0500
-Subject: [PATCH 3/3] drm/bridge: sii902x: Add D3 Cold power management via
+Subject: [PATCH 3/4] drm/bridge: sii902x: Add D3 Cold power management via
  atomic callbacks
 
 Add D3 Cold power management driven by DRM atomic callbacks rather
