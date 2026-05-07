@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /**
- * DT overlay for HDMI audio on AM62P5-SK via McASP1 and SiI9022A.
+ * Audio playback via HDMI for AM625-SK and AM62-LP SK.
  *
- * Copyright (C) 2026 Texas Instruments Incorporated - https://www.ti.com/
+ * Links:
+ * AM625 SK: https://www.ti.com/tool/SK-AM62
+ * AM62-LP SK: https://www.ti.com/tool/SK-AM62-LP
+ *
+ * Copyright (C) 2023-2024 Texas Instruments Incorporated - https://www.ti.com/
  */
 
 /dts-v1/;
 /plugin/;
 
 &{/} {
-	sound_hdmi: sound-hdmi {
+	sound_hdmi: sound-sii9022 {
 		compatible = "audio-graph-card2";
-		label = "AM62P5-Sil9022-HDMI";
+		label = "AM62x-Sil9022-HDMI";
 		links = <&mcasp1_hdmi_port>;
 	};
 };
@@ -37,15 +41,17 @@
 	};
 };
 
-&hdmi_tx_ports {
-	#address-cells = <1>;
-	#size-cells = <0>;
+&sii9022 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
 
-	port@3 {
-		reg = <3>;
+		port@3 {
+			reg = <3>;
 
-		sii9022_audio_ep: endpoint {
-			remote-endpoint = <&mcasp1_hdmi_ep>;
+			sii9022_audio_ep: endpoint {
+				remote-endpoint = <&mcasp1_hdmi_ep>;
+			};
 		};
 	};
 };
