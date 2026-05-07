@@ -3,7 +3,7 @@
 Reference implementation for AM62P5-SK HDMI display and audio using
 the modern DRM_BRIDGE_OP_HDMI framework and audio-graph-card2.
 
-Tested on TI AM62P5-SK, kernel **ti-linux-6.18.y**.
+Patches are based on **upstream linux-next**. Tested on TI AM62P5-SK.
 
 ---
 
@@ -37,12 +37,11 @@ overlays/
 
 ## Setting up the branch
 
-Clone the TI vendor kernel and create a working branch:
+Clone linux-next and create a working branch:
 
 ```bash
-git clone git://git.ti.com/ti-linux-kernel/ti-linux-kernel.git
-cd ti-linux-kernel
-git checkout ti-linux-6.18.y
+git clone https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
+cd linux-next
 git checkout -b sii902x-hdmi-refactor
 ```
 
@@ -57,23 +56,6 @@ git am patches/driver/0001-*.patch
 git am patches/driver/0002-*.patch
 git am patches/driver/0003-*.patch
 git am patches/driver/0004-*.patch
-```
-
-If `git am` rejects due to context drift from the vendor tree, use
-three-way merge:
-
-```bash
-git am -3 patches/driver/0002-*.patch
-```
-
-Or apply manually and commit:
-
-```bash
-patch -p1 < patches/driver/0002-*.patch
-git add drivers/gpu/drm/bridge/sii902x.c
-git commit -s -F - <<'EOF'
-drm/bridge: sii902x: Convert to DRM_BRIDGE_OP_HDMI framework
-EOF
 ```
 
 ### McASP audio-graph-card2 patch
