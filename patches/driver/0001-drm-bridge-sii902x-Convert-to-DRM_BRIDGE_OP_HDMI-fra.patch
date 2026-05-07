@@ -1,33 +1,41 @@
-From 5a6c3a8cd7243661f1c816cf9e8c9f4db8d18c7d Mon Sep 17 00:00:00 2001
+From 2048ca48b38699d492ccc361bfcee07727c73b90 Mon Sep 17 00:00:00 2001
 From: Sen Wang <sen@ti.com>
-Date: Fri, 24 Apr 2026 16:33:16 -0500
-Subject: [PATCH 2/4] drm/bridge: sii902x: Convert to DRM_BRIDGE_OP_HDMI
- framework
+Date: Thu, 7 May 2026 17:48:23 -0500
+Subject: [PATCH] drm/bridge: sii902x: Convert to DRM_BRIDGE_OP_HDMI framework
+ with D3 Cold PM
 
-Convert the SiI9022 HDMI bridge driver from the legacy hdmi-codec
-platform device and manual AVI infoframe packing to the modern
-DRM_BRIDGE_OP_HDMI and DRM_BRIDGE_OP_HDMI_AUDIO framework.
+Convert the SiI9022 HDMI bridge driver to use the modern DRM_BRIDGE_OP_HDMI
+and DRM_BRIDGE_OP_HDMI_AUDIO framework and add D3 Cold power management
+via DRM atomic callbacks.
 
-The DRM bridge connector framework now manages infoframe lifecycle
-and creates the HDMI audio codec device. A legacy hdmi-codec platform
-device is still registered at probe for backwards compatibility with
-existing DTS bindings that use sound-dai = <&sii9022> in
-simple-audio-card or audio-graph-card nodes. When the display
-controller uses DRM_BRIDGE_ATTACH_NO_CONNECTOR (the modern path),
-the legacy device is unregistered in attach to avoid duplicates.
+- Set DRM_BRIDGE_OP_HDMI | DRM_BRIDGE_OP_HDMI_AUDIO on the bridge.
+- Implement hdmi_write_infoframe / hdmi_clear_infoframe with AVI and
+  Audio infoframe handling. VSIF has no dedicated register space on
+  SiI9022A TPI and is silently dropped.
+- Add audio callbacks: hdmi_audio_startup, hdmi_audio_prepare,
+  hdmi_audio_shutdown, hdmi_audio_mute_stream.
+- Remove manually created hdmi-codec platform device; the framework
+  creates it via drm_connector_hdmi_audio_init().
+- Replace atomic_disable + mode_set + atomic_enable with a single
+  atomic_enable. Output sequence: exit D3 -> set output mode -> D0 ->
+  write video timing -> update infoframes -> start TMDS.
+- D3 Cold entry in atomic_disable: save context, hardware reset, enable
+  HPD-only interrupt, write D3 power state.
+- D3 Cold exit in atomic_enable: detect d3_suspended flag, re-init TPI,
+  restore interrupt mask and audio config register.
+- IRQ handler: use drm_bridge_hpd_notify() exclusively; remove legacy
+  drm_helper_hpd_irq_event() that left ELD unpopulated.
+- Store next_bridge in struct sii902x (drm_bridge.next_bridge not
+  available in 6.18); use of_drm_find_bridge() accordingly.
 
-The atomic_enable function is restructured to use two mutex sections
-instead of three: one for video timing and D0 power-up, and one that
-combines the AVI infoframe write and TMDS enable for the legacy
-connector path.
-
-Signed-off-by: Sen Wang <s-wang12@ti.com>
+Tested on AM62P5-SK with HDMI display, HDMI audio, hotplug, and
+suspend/resume with D3 Cold entry and exit.
 ---
- drivers/gpu/drm/bridge/sii902x.c | 739 +++++++++++++++++++++----------
- 1 file changed, 510 insertions(+), 229 deletions(-)
+ drivers/gpu/drm/bridge/sii902x.c | 905 ++++++++++++++++++-------------
+ 1 file changed, 531 insertions(+), 374 deletions(-)
 
 diff --git a/drivers/gpu/drm/bridge/sii902x.c b/drivers/gpu/drm/bridge/sii902x.c
-index 60d1e2d97c2c..317ff0729df7 100644
+index 8a3fdccc665e..098decce5843 100644
 --- a/drivers/gpu/drm/bridge/sii902x.c
 +++ b/drivers/gpu/drm/bridge/sii902x.c
 @@ -21,6 +21,7 @@
@@ -38,15 +46,99 @@ index 60d1e2d97c2c..317ff0729df7 100644
  #include <drm/drm_atomic_helper.h>
  #include <drm/drm_bridge.h>
  #include <drm/drm_drv.h>
-@@ -178,6 +179,7 @@ struct sii902x {
- 	struct drm_connector connector;
+@@ -180,8 +181,9 @@ struct sii902x {
  	struct gpio_desc *reset_gpio;
  	struct i2c_mux_core *i2cmux;
-+	struct device_link *link;
+ 	struct device_link *link;
+-	unsigned int ctx_tpi;
+ 	unsigned int ctx_interrupt;
++	unsigned int ctx_audio_config;
++	bool d3_suspended;
  	u32 bus_width;
  
  	/*
-@@ -370,34 +372,32 @@ static void sii902x_bridge_atomic_enable(struct drm_bridge *bridge,
+@@ -193,13 +195,6 @@ struct sii902x {
+ 		struct platform_device *pdev;
+ 		struct clk *mclk;
+ 		u32 i2s_fifo_sequence[4];
+-		bool active;
+-		/* Audio register context for save/resume */
+-		unsigned int ctx_i2s_input_config;
+-		unsigned int ctx_audio_config_byte2;
+-		unsigned int ctx_audio_config_byte3;
+-		u8 ctx_i2s_stream_header[SII902X_TPI_I2S_STRM_HDR_SIZE];
+-		u8 ctx_audio_infoframe[SII902X_TPI_MISC_INFOFRAME_SIZE];
+ 	} audio;
+ };
+ 
+@@ -331,17 +326,66 @@ static const struct drm_connector_helper_funcs sii902x_connector_helper_funcs =
+ 	.get_modes = sii902x_get_modes,
+ };
+ 
++static int sii902x_set_power_state(struct sii902x *sii902x, unsigned int d_state)
++{
++	return regmap_update_bits(sii902x->regmap, SII902X_PWR_STATE_CTRL,
++				  SII902X_AVI_POWER_STATE_MSK,
++				  SII902X_AVI_POWER_STATE_D(d_state));
++}
++
++static unsigned int sii902x_clear_interrupts(struct sii902x *sii902x)
++{
++	unsigned int status;
++
++	regmap_read(sii902x->regmap, SII902X_INT_STATUS, &status);
++	regmap_write(sii902x->regmap, SII902X_INT_STATUS, status);
++	return status;
++}
++
++static int sii902x_audio_decode_l0(struct sii902x *sii902x)
++{
++	int ret;
++
++	ret = regmap_write(sii902x->regmap, SII902X_IND_SET_PAGE, 0x02);
++	if (ret)
++		return ret;
++
++	ret = regmap_write(sii902x->regmap, SII902X_IND_OFFSET, 0x24);
++	if (ret)
++		return ret;
++
++	return regmap_write(sii902x->regmap, SII902X_IND_VALUE, 0x02);
++}
++
+ static void sii902x_bridge_atomic_disable(struct drm_bridge *bridge,
+ 					  struct drm_atomic_state *state)
+ {
+ 	struct sii902x *sii902x = bridge_to_sii902x(bridge);
+ 
++	/* Save state before D3 Cold chip reset. */
++	regmap_read(sii902x->regmap, SII902X_INT_ENABLE, &sii902x->ctx_interrupt);
++	regmap_read(sii902x->regmap, SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
++		    &sii902x->ctx_audio_config);
++
+ 	mutex_lock(&sii902x->mutex);
+ 
+ 	regmap_update_bits(sii902x->regmap, SII902X_SYS_CTRL_DATA,
+ 			   SII902X_SYS_CTRL_PWR_DWN,
+ 			   SII902X_SYS_CTRL_PWR_DWN);
+ 
++	/* D3 Cold entry */
++	if (sii902x->reset_gpio) {
++		sii902x_clear_interrupts(sii902x);
++		sii902x_reset(sii902x);
++		regmap_write(sii902x->regmap, SII902X_REG_TPI_RQB, 0x0);
++		regmap_write(sii902x->regmap, SII902X_INT_ENABLE,
++			     SII902X_HOTPLUG_EVENT);
++		sii902x_clear_interrupts(sii902x);
++
++		sii902x->d3_suspended = true;
++		sii902x_set_power_state(sii902x, 3);
++	}
++
+ 	mutex_unlock(&sii902x->mutex);
+ }
+ 
+@@ -350,36 +394,57 @@ static void sii902x_bridge_atomic_enable(struct drm_bridge *bridge,
  {
  	struct sii902x *sii902x = bridge_to_sii902x(bridge);
  	struct drm_connector *connector;
@@ -56,6 +148,31 @@ index 60d1e2d97c2c..317ff0729df7 100644
  	u8 output_mode = SII902X_SYS_CTRL_OUTPUT_DVI;
 +	u8 buf[10];
 +	u16 pixel_clock_10kHz;
++
++	/* Full hardware init required after D3. */
++	if (sii902x->d3_suspended) {
++		int i;
++
++		sii902x->d3_suspended = false;
++		sii902x_reset(sii902x);
++		regmap_write(sii902x->regmap, SII902X_REG_TPI_RQB, 0x0);
++		regmap_write(sii902x->regmap, SII902X_INT_ENABLE,
++			     sii902x->ctx_interrupt);
++		sii902x_clear_interrupts(sii902x);
++
++		/* Restore audio hardware state lost on chip reset. */
++		if (sii902x->ctx_audio_config) {
++			for (i = 0; i < ARRAY_SIZE(sii902x->audio.i2s_fifo_sequence) &&
++				    sii902x->audio.i2s_fifo_sequence[i]; i++)
++				regmap_write(sii902x->regmap,
++					     SII902X_TPI_I2S_ENABLE_MAPPING_REG,
++					     sii902x->audio.i2s_fifo_sequence[i]);
++			sii902x_audio_decode_l0(sii902x);
++			regmap_write(sii902x->regmap,
++				     SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
++				     sii902x->ctx_audio_config);
++		}
++	}
  
  	connector = drm_atomic_get_new_connector_for_encoder(state, bridge->encoder);
 -	if (connector && connector->display_info.is_hdmi)
@@ -70,7 +187,9 @@ index 60d1e2d97c2c..317ff0729df7 100644
  
 -	regmap_update_bits(sii902x->regmap, SII902X_SYS_CTRL_DATA,
 -			   SII902X_SYS_CTRL_OUTPUT_MODE, output_mode);
--	sii902x_set_power_state(sii902x, 0);
+-	regmap_update_bits(sii902x->regmap, SII902X_PWR_STATE_CTRL,
+-			   SII902X_AVI_POWER_STATE_MSK,
+-			   SII902X_AVI_POWER_STATE_D(0));
 -	regmap_update_bits(sii902x->regmap, SII902X_SYS_CTRL_DATA,
 -			   SII902X_SYS_CTRL_PWR_DWN, 0);
 +	crtc_state = drm_atomic_get_new_crtc_state(state, conn_state->crtc);
@@ -99,7 +218,7 @@ index 60d1e2d97c2c..317ff0729df7 100644
  	buf[0] = pixel_clock_10kHz & 0xff;
  	buf[1] = pixel_clock_10kHz >> 8;
  	buf[2] = drm_mode_vrefresh(adj);
-@@ -413,30 +413,49 @@ static void sii902x_bridge_mode_set(struct drm_bridge *bridge,
+@@ -395,30 +460,49 @@ static void sii902x_bridge_mode_set(struct drm_bridge *bridge,
  
  	mutex_lock(&sii902x->mutex);
  
@@ -170,22 +289,18 @@ index 60d1e2d97c2c..317ff0729df7 100644
  }
  
  static int sii902x_bridge_attach(struct drm_bridge *bridge,
-@@ -446,26 +465,50 @@ static int sii902x_bridge_attach(struct drm_bridge *bridge,
- 	struct sii902x *sii902x = bridge_to_sii902x(bridge);
- 	u32 bus_format = MEDIA_BUS_FMT_RGB888_1X24;
- 	struct drm_device *drm = bridge->dev;
-+	struct device *dev = &sii902x->i2c->dev;
- 	int ret;
+@@ -433,20 +517,36 @@ static int sii902x_bridge_attach(struct drm_bridge *bridge,
+ 
+ 	sii902x->link = device_link_add(drm->dev, dev, DL_FLAG_STATELESS);
+ 	if (!sii902x->link) {
+-		dev_err(dev, "failed to create device link");
++		dev_err(dev, "failed to create device link\n");
+ 		return -EINVAL;
+ 	}
  
 -	if (flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR)
--		return drm_bridge_attach(encoder, sii902x->bridge.next_bridge,
+-		return drm_bridge_attach(encoder, sii902x->next_bridge,
 -					 bridge, flags);
-+	sii902x->link = device_link_add(drm->dev, dev, DL_FLAG_STATELESS);
-+	if (!sii902x->link) {
-+		dev_err(dev, "failed to create device link\n");
-+		return -EINVAL;
-+	}
-+
 +	if (flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR) {
 +		/*
 +		 * The framework creates its own audio codec via
@@ -197,8 +312,8 @@ index 60d1e2d97c2c..317ff0729df7 100644
 +			sii902x->audio.pdev = NULL;
 +		}
 +
-+		if (sii902x->bridge.next_bridge) {
-+			ret = drm_bridge_attach(encoder, sii902x->bridge.next_bridge,
++		if (sii902x->next_bridge) {
++			ret = drm_bridge_attach(encoder, sii902x->next_bridge,
 +						bridge, flags);
 +			if (ret)
 +				goto err_bridge_attach;
@@ -210,51 +325,13 @@ index 60d1e2d97c2c..317ff0729df7 100644
  				 &sii902x_connector_helper_funcs);
  
  	if (!drm_core_check_feature(drm, DRIVER_ATOMIC)) {
--		dev_err(&sii902x->i2c->dev,
+ 		dev_err(dev,
 -			"sii902x driver is only compatible with DRM devices supporting atomic updates\n");
--		return -ENOTSUPP;
-+		dev_err(dev,
 +			"legacy connector requires atomic modesetting support\n");
-+		ret = -EOPNOTSUPP;
-+		goto err_bridge_attach;
+ 		ret = -EOPNOTSUPP;
+ 		goto err_bridge_attach;
  	}
- 
- 	ret = drm_connector_init(drm, &sii902x->connector,
- 				 &sii902x_connector_funcs,
- 				 DRM_MODE_CONNECTOR_HDMIA);
- 	if (ret)
--		return ret;
-+		goto err_bridge_attach;
- 
- 	if (sii902x->i2c->irq > 0)
- 		sii902x->connector.polled = DRM_CONNECTOR_POLL_HPD;
-@@ -475,11 +518,24 @@ static int sii902x_bridge_attach(struct drm_bridge *bridge,
- 	ret = drm_display_info_set_bus_formats(&sii902x->connector.display_info,
- 					       &bus_format, 1);
- 	if (ret)
--		return ret;
-+		goto err_bridge_attach;
- 
- 	drm_connector_attach_encoder(&sii902x->connector, encoder);
- 
- 	return 0;
-+
-+err_bridge_attach:
-+	device_link_del(sii902x->link);
-+
-+	return ret;
-+}
-+
-+static void sii902x_bridge_detach(struct drm_bridge *bridge)
-+{
-+	struct sii902x *sii902x = bridge_to_sii902x(bridge);
-+
-+	if (sii902x->link)
-+		device_link_del(sii902x->link);
- }
- 
- static enum drm_connector_status
-@@ -505,7 +561,6 @@ static u32 *sii902x_bridge_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
+@@ -508,7 +608,6 @@ static u32 *sii902x_bridge_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
  						     u32 output_fmt,
  						     unsigned int *num_input_fmts)
  {
@@ -262,7 +339,7 @@ index 60d1e2d97c2c..317ff0729df7 100644
  	struct sii902x *sii902x = bridge_to_sii902x(bridge);
  	u32 *input_fmts;
  
-@@ -526,6 +581,7 @@ static u32 *sii902x_bridge_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
+@@ -529,6 +628,7 @@ static u32 *sii902x_bridge_atomic_get_input_bus_fmts(struct drm_bridge *bridge,
  		input_fmts[0] = MEDIA_BUS_FMT_RGB888_1X24;
  		break;
  	default:
@@ -270,12 +347,13 @@ index 60d1e2d97c2c..317ff0729df7 100644
  		return NULL;
  	}
  
-@@ -566,34 +622,99 @@ sii902x_bridge_mode_valid(struct drm_bridge *bridge,
+@@ -569,35 +669,80 @@ sii902x_bridge_mode_valid(struct drm_bridge *bridge,
  	return MODE_OK;
  }
  
 -static const struct drm_bridge_funcs sii902x_bridge_funcs = {
 -	.attach = sii902x_bridge_attach,
+-	.detach = sii902x_bridge_detach,
 -	.mode_set = sii902x_bridge_mode_set,
 -	.atomic_disable = sii902x_bridge_atomic_disable,
 -	.atomic_enable = sii902x_bridge_atomic_enable,
@@ -293,106 +371,87 @@ index 60d1e2d97c2c..317ff0729df7 100644
 +					 const struct drm_display_mode *mode,
 +					 unsigned long long tmds_rate)
 +{
-+	if (mode->clock < SII902X_MIN_PIXEL_CLOCK_KHZ)
-+		return MODE_CLOCK_LOW;
++	return sii902x_bridge_mode_valid((struct drm_bridge *)bridge, NULL, mode);
++}
  
 -static int sii902x_mute(struct sii902x *sii902x, bool mute)
-+	if (mode->clock > SII902X_MAX_PIXEL_CLOCK_KHZ)
-+		return MODE_CLOCK_HIGH;
-+
-+	return MODE_OK;
-+}
-+
 +/* HDMI infoframe callbacks — framework packs, driver writes to hardware. */
 +
-+static int sii902x_bridge_hdmi_write_avi_infoframe(struct drm_bridge *bridge,
-+						    const u8 *buffer, size_t len)
++static int sii902x_bridge_hdmi_write_infoframe(struct drm_bridge *bridge,
++					       enum hdmi_infoframe_type type,
++					       const u8 *buffer, size_t len)
  {
 -	struct device *dev = &sii902x->i2c->dev;
 -	unsigned int val = mute ? SII902X_TPI_AUDIO_MUTE_ENABLE :
 -		SII902X_TPI_AUDIO_MUTE_DISABLE;
 +	struct sii902x *sii902x = bridge_to_sii902x(bridge);
-+
-+	/* Skip the infoframe header, keep the CRC field. */
-+	mutex_lock(&sii902x->mutex);
-+	regmap_bulk_write(sii902x->regmap, SII902X_TPI_AVI_INFOFRAME,
-+			  buffer + HDMI_INFOFRAME_HEADER_SIZE - 1,
-+			  min_t(size_t, len - HDMI_INFOFRAME_HEADER_SIZE + 1,
-+				HDMI_AVI_INFOFRAME_SIZE + 1));
-+	mutex_unlock(&sii902x->mutex);
  
 -	dev_dbg(dev, "%s: %s\n", __func__, mute ? "Muted" : "Unmuted");
-+	return 0;
-+}
++	switch (type) {
++	case HDMI_INFOFRAME_TYPE_AVI:
++		/* Skip the infoframe header, keep the CRC field. */
++		mutex_lock(&sii902x->mutex);
++		regmap_bulk_write(sii902x->regmap, SII902X_TPI_AVI_INFOFRAME,
++				  buffer + HDMI_INFOFRAME_HEADER_SIZE - 1,
++				  min_t(size_t, len - HDMI_INFOFRAME_HEADER_SIZE + 1,
++					HDMI_AVI_INFOFRAME_SIZE + 1));
++		mutex_unlock(&sii902x->mutex);
++		break;
++	case HDMI_INFOFRAME_TYPE_AUDIO:
++		mutex_lock(&sii902x->mutex);
++		regmap_bulk_write(sii902x->regmap, SII902X_TPI_MISC_INFOFRAME_BASE,
++				  buffer, min_t(size_t, len,
++						SII902X_TPI_MISC_INFOFRAME_SIZE));
++		mutex_unlock(&sii902x->mutex);
++		break;
++	default:
++		/* VSIF and other types: no dedicated register space on SiI9022A */
++		break;
++	}
  
 -	return regmap_update_bits(sii902x->regmap,
 -				  SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
 -				  SII902X_TPI_AUDIO_MUTE_ENABLE, val);
-+static int sii902x_bridge_hdmi_clear_avi_infoframe(struct drm_bridge *bridge)
++	return 0;
++}
++
++static int sii902x_bridge_hdmi_clear_infoframe(struct drm_bridge *bridge,
++					       enum hdmi_infoframe_type type)
 +{
 +	struct sii902x *sii902x = bridge_to_sii902x(bridge);
-+	u8 buf[HDMI_AVI_INFOFRAME_SIZE + 1] = {0};
 +
-+	mutex_lock(&sii902x->mutex);
-+	regmap_bulk_write(sii902x->regmap, SII902X_TPI_AVI_INFOFRAME,
-+			  buf, sizeof(buf));
-+	mutex_unlock(&sii902x->mutex);
++	switch (type) {
++	case HDMI_INFOFRAME_TYPE_AVI: {
++		u8 buf[HDMI_AVI_INFOFRAME_SIZE + 1] = {0};
++
++		mutex_lock(&sii902x->mutex);
++		regmap_bulk_write(sii902x->regmap, SII902X_TPI_AVI_INFOFRAME,
++				  buf, sizeof(buf));
++		mutex_unlock(&sii902x->mutex);
++		break;
++	}
++	case HDMI_INFOFRAME_TYPE_AUDIO: {
++		u8 buf[SII902X_TPI_MISC_INFOFRAME_SIZE] = {0};
++
++		mutex_lock(&sii902x->mutex);
++		regmap_bulk_write(sii902x->regmap, SII902X_TPI_MISC_INFOFRAME_BASE,
++				  buf, sizeof(buf));
++		mutex_unlock(&sii902x->mutex);
++		break;
++	}
++	default:
++		break;
++	}
 +
 +	return 0;
  }
  
-+static int sii902x_bridge_hdmi_write_audio_infoframe(struct drm_bridge *bridge,
-+						      const u8 *buffer,
-+						      size_t len)
-+{
-+	struct sii902x *sii902x = bridge_to_sii902x(bridge);
-+
-+	mutex_lock(&sii902x->mutex);
-+	regmap_bulk_write(sii902x->regmap, SII902X_TPI_MISC_INFOFRAME_BASE,
-+			  buffer, min_t(size_t, len,
-+					SII902X_TPI_MISC_INFOFRAME_SIZE));
-+	mutex_unlock(&sii902x->mutex);
-+
-+	return 0;
-+}
-+
-+static int sii902x_bridge_hdmi_clear_audio_infoframe(struct drm_bridge *bridge)
-+{
-+	struct sii902x *sii902x = bridge_to_sii902x(bridge);
-+	u8 buf[SII902X_TPI_MISC_INFOFRAME_SIZE] = {0};
-+
-+	mutex_lock(&sii902x->mutex);
-+	regmap_bulk_write(sii902x->regmap, SII902X_TPI_MISC_INFOFRAME_BASE,
-+			  buf, sizeof(buf));
-+	mutex_unlock(&sii902x->mutex);
-+
-+	return 0;
-+}
-+
-+/*
-+ * The SiI9022A TPI does not provide dedicated registers for HDMI Vendor
-+ * Specific InfoFrames (VSIF).  The single Misc InfoFrame buffer is already
-+ * used by the Audio InfoFrame, so VSIF transmission is not supported.
-+ * Provide no-op stubs so the DRM_BRIDGE_OP_HDMI framework is satisfied.
-+ */
-+static int sii902x_bridge_hdmi_write_hdmi_infoframe(struct drm_bridge *bridge,
-+						     const u8 *buffer,
-+						     size_t len)
-+{
-+	return 0;
-+}
-+
-+static int sii902x_bridge_hdmi_clear_hdmi_infoframe(struct drm_bridge *bridge)
-+{
-+	return 0;
-+}
-+
 +/* Shared audio helpers used by both legacy and modern audio paths. */
 +
  static const int sii902x_mclk_div_table[] = {
  	128, 256, 384, 512, 768, 1024, 1152, 192 };
  
-@@ -634,6 +755,56 @@ static const struct sii902x_sample_freq {
+@@ -638,6 +783,56 @@ static const struct sii902x_sample_freq {
  	{ .freq = 192000,	.val = SII902X_TPI_AUDIO_FREQ_192KHZ },
  };
  
@@ -449,7 +508,7 @@ index 60d1e2d97c2c..317ff0729df7 100644
  static int sii902x_audio_hw_params(struct device *dev, void *data,
  				   struct hdmi_codec_daifmt *daifmt,
  				   struct hdmi_codec_params *params)
-@@ -648,11 +819,8 @@ static int sii902x_audio_hw_params(struct device *dev, void *data,
+@@ -652,11 +847,8 @@ static int sii902x_audio_hw_params(struct device *dev, void *data,
  	unsigned long mclk_rate;
  	int i, ret;
  
@@ -462,7 +521,7 @@ index 60d1e2d97c2c..317ff0729df7 100644
  
  	switch (daifmt->fmt) {
  	case HDMI_I2S:
-@@ -666,8 +834,6 @@ static int sii902x_audio_hw_params(struct device *dev, void *data,
+@@ -670,8 +862,6 @@ static int sii902x_audio_hw_params(struct device *dev, void *data,
  		i2s_config_reg |= SII902X_TPI_I2S_SD_JUSTIFY_LEFT;
  		break;
  	default:
@@ -471,7 +530,7 @@ index 60d1e2d97c2c..317ff0729df7 100644
  		return -EINVAL;
  	}
  
-@@ -698,8 +864,6 @@ static int sii902x_audio_hw_params(struct device *dev, void *data,
+@@ -702,8 +892,6 @@ static int sii902x_audio_hw_params(struct device *dev, void *data,
  		config_byte3_reg |= SII902X_TPI_AUDIO_SAMPLE_SIZE_24;
  		break;
  	default:
@@ -480,7 +539,7 @@ index 60d1e2d97c2c..317ff0729df7 100644
  		return -EINVAL;
  	}
  
-@@ -711,32 +875,21 @@ static int sii902x_audio_hw_params(struct device *dev, void *data,
+@@ -715,32 +903,21 @@ static int sii902x_audio_hw_params(struct device *dev, void *data,
  	}
  
  	ret = clk_prepare_enable(sii902x->audio.mclk);
@@ -520,7 +579,7 @@ index 60d1e2d97c2c..317ff0729df7 100644
  
  	for (i = 0; i < ARRAY_SIZE(sii902x->audio.i2s_fifo_sequence) &&
  		    sii902x->audio.i2s_fifo_sequence[i]; i++)
-@@ -744,48 +897,26 @@ static int sii902x_audio_hw_params(struct device *dev, void *data,
+@@ -748,59 +925,26 @@ static int sii902x_audio_hw_params(struct device *dev, void *data,
  			     SII902X_TPI_I2S_ENABLE_MAPPING_REG,
  			     sii902x->audio.i2s_fifo_sequence[i]);
  
@@ -549,12 +608,7 @@ index 60d1e2d97c2c..317ff0729df7 100644
 -			__func__, ret);
 -		goto out;
 -	}
-+	if (ret >= 0)
-+		regmap_bulk_write(sii902x->regmap,
-+				  SII902X_TPI_MISC_INFOFRAME_BASE,
-+				  infoframe_buf,
-+				  min(ret, SII902X_TPI_MISC_INFOFRAME_SIZE));
- 
+-
 -	ret = regmap_bulk_write(sii902x->regmap,
 -				SII902X_TPI_MISC_INFOFRAME_BASE,
 -				infoframe_buf,
@@ -562,11 +616,27 @@ index 60d1e2d97c2c..317ff0729df7 100644
 -	if (ret)
 -		goto out;
 -
--	ret = sii902x_audio_decode_l0(sii902x);
+-	/* Decode Level 0 Packets */
+-	ret = regmap_write(sii902x->regmap, SII902X_IND_SET_PAGE, 0x02);
+-	if (ret)
+-		goto out;
++	if (ret >= 0)
++		regmap_bulk_write(sii902x->regmap,
++				  SII902X_TPI_MISC_INFOFRAME_BASE,
++				  infoframe_buf,
++				  min(ret, SII902X_TPI_MISC_INFOFRAME_SIZE));
+ 
+-	ret = regmap_write(sii902x->regmap, SII902X_IND_OFFSET, 0x24);
 -	if (ret)
 -		goto out;
 +	sii902x_audio_decode_l0(sii902x);
  
+-	ret = regmap_write(sii902x->regmap, SII902X_IND_VALUE, 0x02);
+-	if (ret)
+-		goto out;
+-
+-	sii902x->audio.active = true;
+-
 -	dev_dbg(dev, "%s: hdmi audio enabled\n", __func__);
 -out:
  	mutex_unlock(&sii902x->mutex);
@@ -582,7 +652,7 @@ index 60d1e2d97c2c..317ff0729df7 100644
  }
  
  static void sii902x_audio_shutdown(struct device *dev, void *data)
-@@ -793,10 +924,8 @@ static void sii902x_audio_shutdown(struct device *dev, void *data)
+@@ -808,12 +952,8 @@ static void sii902x_audio_shutdown(struct device *dev, void *data)
  	struct sii902x *sii902x = dev_get_drvdata(dev);
  
  	mutex_lock(&sii902x->mutex);
@@ -590,10 +660,12 @@ index 60d1e2d97c2c..317ff0729df7 100644
  	regmap_write(sii902x->regmap, SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
  		     SII902X_TPI_AUDIO_INTERFACE_DISABLE);
 -
+-	sii902x->audio.active = false;
+-
  	mutex_unlock(&sii902x->mutex);
  
  	clk_disable_unprepare(sii902x->audio.mclk);
-@@ -808,126 +937,200 @@ static int sii902x_audio_mute(struct device *dev, void *data,
+@@ -825,126 +965,196 @@ static int sii902x_audio_mute(struct device *dev, void *data,
  	struct sii902x *sii902x = dev_get_drvdata(dev);
  
  	mutex_lock(&sii902x->mutex);
@@ -803,7 +875,8 @@ index 60d1e2d97c2c..317ff0729df7 100644
 -		dev, HDMI_CODEC_DRV_NAME, PLATFORM_DEVID_AUTO,
 -		&codec_data, sizeof(codec_data));
 +	mutex_lock(&sii902x->mutex);
-+
+ 
+-	return PTR_ERR_OR_ZERO(sii902x->audio.pdev);
 +	regmap_write(sii902x->regmap, SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
 +		     config_byte2_reg);
 +	regmap_write(sii902x->regmap, SII902X_TPI_I2S_INPUT_CONFIG_REG,
@@ -819,8 +892,8 @@ index 60d1e2d97c2c..317ff0729df7 100644
 +
 +	return drm_atomic_helper_connector_hdmi_update_audio_infoframe(connector,
 +								       &hparms->cea);
-+}
-+
+ }
+ 
 +static void sii902x_hdmi_audio_shutdown(struct drm_bridge *bridge,
 +					struct drm_connector *connector)
 +{
@@ -847,11 +920,10 @@ index 60d1e2d97c2c..317ff0729df7 100644
 +			   SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
 +			   SII902X_TPI_AUDIO_MUTE_ENABLE, val);
 +	mutex_unlock(&sii902x->mutex);
- 
--	return PTR_ERR_OR_ZERO(sii902x->audio.pdev);
++
 +	return 0;
- }
- 
++}
++
 +static const struct drm_bridge_funcs sii902x_bridge_funcs = {
 +	.attach = sii902x_bridge_attach,
 +	.detach = sii902x_bridge_detach,
@@ -866,12 +938,8 @@ index 60d1e2d97c2c..317ff0729df7 100644
 +	.atomic_check = sii902x_bridge_atomic_check,
 +	.mode_valid = sii902x_bridge_mode_valid,
 +	.hdmi_tmds_char_rate_valid = sii902x_bridge_hdmi_tmds_char_rate_valid,
-+	.hdmi_write_avi_infoframe = sii902x_bridge_hdmi_write_avi_infoframe,
-+	.hdmi_clear_avi_infoframe = sii902x_bridge_hdmi_clear_avi_infoframe,
-+	.hdmi_write_hdmi_infoframe = sii902x_bridge_hdmi_write_hdmi_infoframe,
-+	.hdmi_clear_hdmi_infoframe = sii902x_bridge_hdmi_clear_hdmi_infoframe,
-+	.hdmi_write_audio_infoframe = sii902x_bridge_hdmi_write_audio_infoframe,
-+	.hdmi_clear_audio_infoframe = sii902x_bridge_hdmi_clear_audio_infoframe,
++	.hdmi_write_infoframe = sii902x_bridge_hdmi_write_infoframe,
++	.hdmi_clear_infoframe = sii902x_bridge_hdmi_clear_infoframe,
 +	.hdmi_audio_startup = sii902x_hdmi_audio_startup,
 +	.hdmi_audio_prepare = sii902x_hdmi_audio_prepare,
 +	.hdmi_audio_shutdown = sii902x_hdmi_audio_shutdown,
@@ -881,35 +949,68 @@ index 60d1e2d97c2c..317ff0729df7 100644
  static const struct regmap_range sii902x_volatile_ranges[] = {
  	{ .range_min = 0, .range_max = 0xff },
  };
-@@ -949,7 +1152,7 @@ static const struct regmap_config sii902x_regmap_config = {
+@@ -966,21 +1176,28 @@ static const struct regmap_config sii902x_regmap_config = {
  static irqreturn_t sii902x_interrupt(int irq, void *data)
  {
  	struct sii902x *sii902x = data;
 -	unsigned int status = 0;
+-
+-	mutex_lock(&sii902x->mutex);
 +	unsigned int status;
  
- 	mutex_lock(&sii902x->mutex);
- 	status = sii902x_clear_interrupts(sii902x);
-@@ -957,9 +1160,10 @@ static irqreturn_t sii902x_interrupt(int irq, void *data)
+-	regmap_read(sii902x->regmap, SII902X_INT_STATUS, &status);
+-	regmap_write(sii902x->regmap, SII902X_INT_STATUS, status);
++	/*
++	 * I2C is off in D3 Cold. Report connected to trigger a full
++	 * detect cycle once the device is back in D0.
++	 */
++	if (sii902x->d3_suspended) {
++		if (sii902x->bridge.dev)
++			drm_bridge_hpd_notify(&sii902x->bridge,
++					      connector_status_connected);
++		return IRQ_HANDLED;
++	}
  
- 	if ((status & SII902X_HOTPLUG_EVENT) && sii902x->bridge.dev) {
- 		drm_helper_hpd_irq_event(sii902x->bridge.dev);
++	mutex_lock(&sii902x->mutex);
++	status = sii902x_clear_interrupts(sii902x);
+ 	mutex_unlock(&sii902x->mutex);
+ 
+-	if ((status & SII902X_HOTPLUG_EVENT) && sii902x->bridge.dev) {
+-		drm_helper_hpd_irq_event(sii902x->bridge.dev);
 -		drm_bridge_hpd_notify(&sii902x->bridge, (status & SII902X_PLUGGED_STATUS)
 -								? connector_status_connected
 -								: connector_status_disconnected);
+-	}
++	if ((status & SII902X_HOTPLUG_EVENT) && sii902x->bridge.dev)
 +		drm_bridge_hpd_notify(&sii902x->bridge,
 +				      (status & SII902X_PLUGGED_STATUS)
 +					? connector_status_connected
 +					: connector_status_disconnected);
- 	}
  
  	return IRQ_HANDLED;
-@@ -1086,9 +1290,78 @@ static const struct drm_bridge_timings default_sii902x_timings = {
+ }
+@@ -1106,136 +1323,70 @@ static const struct drm_bridge_timings default_sii902x_timings = {
  		 | DRM_BUS_FLAG_DE_HIGH,
  };
  
+-static int __maybe_unused sii902x_resume(struct device *dev)
 +static int sii902x_audio_init(struct sii902x *sii902x, struct device *dev)
-+{
+ {
+-	struct sii902x *sii902x = dev_get_drvdata(dev);
+-	unsigned int tpi_reg, status;
+-	int ret, i;
+-
+-	ret = regmap_read(sii902x->regmap, SII902X_REG_TPI_RQB, &tpi_reg);
+-	if (ret)
+-		return ret;
+-
+-	if (tpi_reg != sii902x->ctx_tpi) {
+-		/*
+-		 * TPI register context has changed. SII902X power supply
+-		 * device has been turned off and on.
+-		 */
+-
+-		sii902x_reset(sii902x);
 +	static const u8 audio_fifo_id[] = {
 +		SII902X_TPI_I2S_CONFIG_FIFO0,
 +		SII902X_TPI_I2S_CONFIG_FIFO1,
@@ -924,10 +1025,17 @@ index 60d1e2d97c2c..317ff0729df7 100644
 +	};
 +	u8 lanes[4];
 +	int num_lanes, i;
-+
+ 
+-		/* Configure the device to enter TPI mode. */
+-		ret = regmap_write(sii902x->regmap, SII902X_REG_TPI_RQB, 0x0);
+-		if (ret)
+-			return ret;
 +	if (!of_property_present(dev->of_node, "#sound-dai-cells"))
 +		return 0;
-+
+ 
+-		/* Re enable the interrupts */
+-		regmap_write(sii902x->regmap, SII902X_INT_ENABLE,
+-			     sii902x->ctx_interrupt);
 +	num_lanes = of_property_read_variable_u8_array(dev->of_node,
 +						       "sil,i2s-data-lanes",
 +						       lanes, 1,
@@ -937,8 +1045,11 @@ index 60d1e2d97c2c..317ff0729df7 100644
 +		lanes[0] = 0;
 +	} else if (num_lanes < 0) {
 +		return num_lanes;
-+	}
-+
+ 	}
+ 
+-	/* Clear all pending interrupts */
+-	regmap_read(sii902x->regmap, SII902X_INT_STATUS, &status);
+-	regmap_write(sii902x->regmap, SII902X_INT_STATUS, status);
 +	for (i = 0; i < num_lanes; i++)
 +		sii902x->audio.i2s_fifo_sequence[i] |= audio_fifo_id[i] |
 +			i2s_lane_id[lanes[i]] | SII902X_TPI_I2S_FIFO_ENABLE;
@@ -946,54 +1057,127 @@ index 60d1e2d97c2c..317ff0729df7 100644
 +	sii902x->audio.mclk = devm_clk_get_optional(dev, "mclk");
 +	if (IS_ERR(sii902x->audio.mclk))
 +		return PTR_ERR(sii902x->audio.mclk);
-+
-+	/*
+ 
+ 	/*
+-	 * Restore audio context if audio was active before suspend,
+-	 * in the matching order of sii902x_audio_hw_params()
+-	 * initialization
 +	 * DRM_BRIDGE_OP_HDMI_AUDIO fields for the modern bridge connector
 +	 * path.  The legacy hdmi-codec platform device below provides audio
 +	 * for display controllers that do not use DRM_BRIDGE_ATTACH_NO_CONNECTOR.
 +	 * When the modern path is used, the pdev is unregistered in attach.
-+	 */
+ 	 */
+-	if (sii902x->audio.active) {
+-		/* Re-enable mclk */
+-		ret = clk_prepare_enable(sii902x->audio.mclk);
+-		if (ret) {
+-			dev_err(dev, "Failed to re-enable mclk: %d\n", ret);
+-			return ret;
+-		}
+-
+-		ret = regmap_write(sii902x->regmap, SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
+-				   sii902x->audio.ctx_audio_config_byte2);
+-		if (ret)
+-			goto err_audio_resume;
 +	sii902x->bridge.hdmi_audio_dev = dev;
 +	sii902x->bridge.hdmi_audio_max_i2s_playback_channels = 2 * num_lanes;
 +	sii902x->bridge.hdmi_audio_dai_port = SII902X_AUDIO_PORT_INDEX;
-+
-+	{
-+		struct hdmi_codec_pdata codec_data = {
-+			.ops = &sii902x_audio_codec_ops,
-+			.i2s = 1,
-+			.spdif = 0,
-+			.max_i2s_channels = 2 * num_lanes,
-+			.no_capture_mute = 1,
-+		};
-+
-+		sii902x->audio.pdev = platform_device_register_data(
-+			dev, HDMI_CODEC_DRV_NAME, PLATFORM_DEVID_AUTO,
-+			&codec_data, sizeof(codec_data));
-+		if (IS_ERR(sii902x->audio.pdev))
-+			return PTR_ERR(sii902x->audio.pdev);
-+	}
-+
-+	return 0;
-+}
-+
+ 
+-		ret = regmap_write(sii902x->regmap, SII902X_TPI_I2S_INPUT_CONFIG_REG,
+-				   sii902x->audio.ctx_i2s_input_config);
+-		if (ret)
+-			goto err_audio_resume;
+-
+-		for (i = 0; i < ARRAY_SIZE(sii902x->audio.i2s_fifo_sequence) &&
+-		     sii902x->audio.i2s_fifo_sequence[i]; i++) {
+-			ret = regmap_write(sii902x->regmap,
+-					   SII902X_TPI_I2S_ENABLE_MAPPING_REG,
+-					   sii902x->audio.i2s_fifo_sequence[i]);
+-			if (ret)
+-				goto err_audio_resume;
+-		}
+-
+-		ret = regmap_write(sii902x->regmap, SII902X_TPI_AUDIO_CONFIG_BYTE3_REG,
+-				   sii902x->audio.ctx_audio_config_byte3);
+-		if (ret)
+-			goto err_audio_resume;
+-
+-		ret = regmap_bulk_write(sii902x->regmap, SII902X_TPI_I2S_STRM_HDR_BASE,
+-					sii902x->audio.ctx_i2s_stream_header,
+-					SII902X_TPI_I2S_STRM_HDR_SIZE);
+-		if (ret)
+-			goto err_audio_resume;
+-
+-		ret = regmap_bulk_write(sii902x->regmap, SII902X_TPI_MISC_INFOFRAME_BASE,
+-					sii902x->audio.ctx_audio_infoframe,
+-					SII902X_TPI_MISC_INFOFRAME_SIZE);
+-		if (ret)
+-			goto err_audio_resume;
+-	}
+-
+-	return 0;
+-
+-err_audio_resume:
+-	clk_disable_unprepare(sii902x->audio.mclk);
+-	dev_err(dev, "Failed to restore audio registers: %d\n", ret);
+-	return ret;
+-}
+-
+-static int __maybe_unused sii902x_suspend(struct device *dev)
+-{
+-	struct sii902x *sii902x = dev_get_drvdata(dev);
+-
+-	regmap_read(sii902x->regmap, SII902X_REG_TPI_RQB,
+-		    &sii902x->ctx_tpi);
+-
+-	regmap_read(sii902x->regmap, SII902X_INT_ENABLE,
+-		    &sii902x->ctx_interrupt);
++	struct hdmi_codec_pdata codec_data = {
++		.ops = &sii902x_audio_codec_ops,
++		.i2s = 1,
++		.spdif = 0,
++		.max_i2s_channels = 2 * num_lanes,
++		.no_capture_mute = 1,
++	};
+ 
+-	/*
+-	 * Save audio context if audio is active, and
+-	 * in the matching order of sii902x_audio_hw_params()
+-	 * initialization
+-	 */
+-	if (sii902x->audio.active) {
+-		regmap_read(sii902x->regmap, SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
+-			    &sii902x->audio.ctx_audio_config_byte2);
+-		regmap_read(sii902x->regmap, SII902X_TPI_I2S_INPUT_CONFIG_REG,
+-			    &sii902x->audio.ctx_i2s_input_config);
+-		regmap_read(sii902x->regmap, SII902X_TPI_AUDIO_CONFIG_BYTE3_REG,
+-			    &sii902x->audio.ctx_audio_config_byte3);
+-		regmap_bulk_read(sii902x->regmap, SII902X_TPI_I2S_STRM_HDR_BASE,
+-				 sii902x->audio.ctx_i2s_stream_header,
+-				 SII902X_TPI_I2S_STRM_HDR_SIZE);
+-		regmap_bulk_read(sii902x->regmap, SII902X_TPI_MISC_INFOFRAME_BASE,
+-				 sii902x->audio.ctx_audio_infoframe,
+-				 SII902X_TPI_MISC_INFOFRAME_SIZE);
+-
+-		/* Disable mclk during suspend */
+-		clk_disable_unprepare(sii902x->audio.mclk);
+-	}
++	sii902x->audio.pdev = platform_device_register_data(
++		dev, HDMI_CODEC_DRV_NAME, PLATFORM_DEVID_AUTO,
++		&codec_data, sizeof(codec_data));
+ 
+-	return 0;
++	return PTR_ERR_OR_ZERO(sii902x->audio.pdev);
+ }
+ 
+-static const struct dev_pm_ops sii902x_pm_ops = {
+-	SET_SYSTEM_SLEEP_PM_OPS(sii902x_suspend, sii902x_resume)
+-};
+-
  static int sii902x_init(struct sii902x *sii902x)
  {
  	struct device *dev = &sii902x->i2c->dev;
-+	unsigned int status = 0;
- 	u8 chipid[4];
- 	int ret;
- 
-@@ -1112,7 +1385,8 @@ static int sii902x_init(struct sii902x *sii902x)
- 	}
- 
- 	/* Clear all pending interrupts */
--	sii902x_clear_interrupts(sii902x);
-+	regmap_read(sii902x->regmap, SII902X_INT_STATUS, &status);
-+	regmap_write(sii902x->regmap, SII902X_INT_STATUS, status);
- 
- 	if (sii902x->i2c->irq > 0) {
- 		regmap_write(sii902x->regmap, SII902X_INT_ENABLE,
-@@ -1126,7 +1400,7 @@ static int sii902x_init(struct sii902x *sii902x)
+@@ -1278,7 +1429,7 @@ static int sii902x_init(struct sii902x *sii902x)
  			return ret;
  	}
  
@@ -1002,7 +1186,7 @@ index 60d1e2d97c2c..317ff0729df7 100644
  	if (ret)
  		return ret;
  
-@@ -1148,8 +1422,15 @@ static int sii902x_init(struct sii902x *sii902x)
+@@ -1300,8 +1451,15 @@ static int sii902x_init(struct sii902x *sii902x)
  
  	sii902x->bridge.of_node = dev->of_node;
  	sii902x->bridge.timings = &default_sii902x_timings;
@@ -1019,6 +1203,14 @@ index 60d1e2d97c2c..317ff0729df7 100644
  
  	if (sii902x->i2c->irq > 0)
  		sii902x->bridge.ops |= DRM_BRIDGE_OP_HPD;
+@@ -1414,7 +1572,6 @@ static struct i2c_driver sii902x_driver = {
+ 	.remove = sii902x_remove,
+ 	.driver = {
+ 		.name = "sii902x",
+-		.pm = &sii902x_pm_ops,
+ 		.of_match_table = sii902x_dt_ids,
+ 	},
+ 	.id_table = sii902x_i2c_ids,
 -- 
 2.43.0
 
