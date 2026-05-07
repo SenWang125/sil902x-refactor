@@ -1,0 +1,36 @@
+From 605f46fea35e9643be881a9e489e1c6587df94a7 Mon Sep 17 00:00:00 2001
+From: Sen Wang <sen@ti.com>
+Date: Fri, 24 Apr 2026 16:34:12 -0500
+Subject: [PATCH 0/3] drm/bridge: sii902x: Convert to DRM_BRIDGE_OP_HDMI with D3 Cold PM
+
+Convert the SiI9022 HDMI bridge driver to the modern DRM_BRIDGE_OP_HDMI
+and DRM_BRIDGE_OP_HDMI_AUDIO framework and add D3 Cold power management
+via DRM atomic callbacks.
+
+Patch 1 extracts three helper functions used inline in the driver with
+no functional change. Patch 2 performs the framework conversion. Patch 3
+adds D3 Cold power management.
+
+Backwards compatibility with existing DTS bindings is preserved: the
+legacy hdmi-codec platform device is kept for boards using
+sound-dai = <&sii9022> in simple-audio-card or audio-graph-card nodes.
+It is unregistered only when the display controller uses
+DRM_BRIDGE_ATTACH_NO_CONNECTOR (the modern path), where the framework
+creates its own audio codec device.
+
+Tested on AM62P5-SK with HDMI display and audio. Tested display output,
+HDMI audio playback, hotplug detection, and suspend/resume with D3 Cold
+entry and exit.
+
+Sen Wang (3):
+  drm/bridge: sii902x: Extract helpers for power state and interrupt
+    handling
+  drm/bridge: sii902x: Convert to DRM_BRIDGE_OP_HDMI framework
+  drm/bridge: sii902x: Add D3 Cold power management via atomic callbacks
+
+ drivers/gpu/drm/bridge/sii902x.c | 821 ++++++++++++++++++++++---------
+ 1 file changed, 578 insertions(+), 243 deletions(-)
+
+-- 
+2.43.0
+
