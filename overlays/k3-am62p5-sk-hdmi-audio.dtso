@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /**
- * HDMI audio via McASP1 and SiI9022A bridge for AM62P5-SK.
- *
- * Uses audio-graph-card2 with OF-graph endpoints.
- * Requires davinci-mcasp audio-graph-card2 support patch.
+ * DT overlay for HDMI audio on AM62P5-SK via McASP1 and SiI9022A.
  *
  * Copyright (C) 2026 Texas Instruments Incorporated - https://www.ti.com/
  */
@@ -11,27 +8,6 @@
 /dts-v1/;
 /plugin/;
 
-&{/} {
-	hdmi_audio: sound-hdmi {
-		compatible = "audio-graph-card2";
-		label = "AM62P5-Sil9022-HDMI";
-
-		/*
-		 * links points to the port node on the CPU (McASP) side.
-		 * audio-graph-card2 follows the remote-endpoint to discover
-		 * the codec (sii9022 hdmi-audio-codec).
-		 */
-		links = <&mcasp1_hdmi_port>;
-	};
-};
-
-/*
- * McASP1: audio-graph-card2 port for HDMI I2S output.
- *
- * The patched davinci-mcasp driver detects MCASP_GRAPH_PORTS mode
- * when a "ports" child is present without a DPCM topology on the
- * remote side, registering a single DAI (port reg 0 -> DAI 0).
- */
 &mcasp1 {
 	auxclk-fs-ratio = <2177>;
 
@@ -41,8 +17,6 @@
 
 		mcasp1_hdmi_port: port@0 {
 			reg = <0>;
-
-			/* McASP is I2S bit clock and frame sync provider */
 			bitclock-master;
 			frame-master;
 
@@ -53,14 +27,6 @@
 	};
 };
 
-/*
- * SiI9022A: audio port for OF-graph routing.
- *
- * SII902X_AUDIO_PORT_INDEX = 3; the drm_connector_hdmi_audio_init()
- * get_dai_id callback matches port reg 3 -> codec DAI 0.
- * The hdmi-audio-codec platform device inherits sii9022's of_node,
- * so audio-graph-card2 finds it when searching for this endpoint.
- */
 &hdmi_tx_ports {
 	#address-cells = <1>;
 	#size-cells = <0>;
@@ -74,7 +40,14 @@
 	};
 };
 
-/* Disable TLV320 card while HDMI audio overlay is active */
 &codec_audio {
 	status = "disabled";
+};
+
+&{/} {
+	sound_hdmi: sound-hdmi {
+		compatible = "audio-graph-card2";
+		label = "AM62P5-Sil9022-HDMI";
+		links = <&mcasp1_hdmi_port>;
+	};
 };
