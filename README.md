@@ -134,39 +134,6 @@ rtcwake -m mem -s 5
 
 ---
 
-## Architecture notes
-
-### DRM_BRIDGE_OP_HDMI
-
-Sets `bridge.type = DRM_MODE_CONNECTOR_HDMIA` so
-`drm_bridge_connector_init()` creates the HDMI connector automatically.
-AVI infoframes are generated and replayed by the framework on every
-modeset. The audio codec device is created by
-`drm_connector_hdmi_audio_init()` parented to the bridge device, with
-its `of_node` pointing to the sii9022 DT node — enabling OF-graph
-discovery by audio-graph-card2.
-
-### D3 Cold via atomic callbacks
-
-The D3 Cold entry sequence (datasheet §6.9.1.1) requires a hardware
-reset followed by TPI re-initialisation. `dev_pm_ops` cannot be used
-because the I2C parent suspends before the DRM bridge in the PM
-ordering. DRM atomic callbacks (`atomic_disable`/`atomic_enable`) run
-inside the display pipeline before any bus parent suspends, keeping
-register access valid throughout.
-
-### audio-graph-card2
-
-`audio-graph-card2` uses OF-graph endpoint traversal to match
-endpoints to DAIs, which works with the dynamically-created
-`hdmi-audio-codec` platform device that shares the sii9022 `of_node`.
-The McASP driver's `MCASP_GRAPH_PORTS` mode registers one DAI for a
-single `ports { port@0 }` structure. The sii9022 audio port at
-`port@3` (reg=3) is matched by `get_dai_id`
-(`SII902X_AUDIO_PORT_INDEX = 3`).
-
----
-
 ## References
 
 - SiI9022A Programming Guide (Silicon Image AN-1021)
