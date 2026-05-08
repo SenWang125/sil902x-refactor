@@ -1,0 +1,134 @@
+From fdd644b9540d21fe9a9ac01a670f14272f136483 Mon Sep 17 00:00:00 2001
+From: Sen Wang <sen@ti.com>
+Date: Thu, 7 May 2026 19:00:51 -0500
+Subject: [PATCH 3/3] drm/bridge: sii902x: Add D3 Cold power management via
+ atomic callbacks
+
+Add D3 Cold power management using DRM atomic callbacks instead of
+dev_pm_ops. The I2C parent suspends before the DRM bridge in the PM
+ordering, so dev_pm_ops cannot be used to enter D3 safely.
+
+- atomic_disable: save interrupt enable and audio config registers,
+  issue hardware reset, set HPD-only interrupt mask, enter D3 Cold.
+- atomic_enable: detect d3_suspended flag on re-enable; restore TPI
+  mode, interrupt mask, and audio hardware state after chip reset.
+- Audio context restore: re-write I2S FIFO sequence, audio decode
+  level 0, and audio config register to recover playback after reset.
+- IRQ handler: replace drm_helper_hpd_irq_event() with
+  drm_bridge_hpd_notify() exclusively. In D3, reports connected to
+  trigger a full detect cycle without register access. Fixes connector
+  ELD not being populated on hotplug.
+---
+ drivers/gpu/drm/bridge/sii902x.c | 61 ++++++++++++++++++++++++++++++--
+ 1 file changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/bridge/sii902x.c b/drivers/gpu/drm/bridge/sii902x.c
+index 428c21589a71..098decce5843 100644
+--- a/drivers/gpu/drm/bridge/sii902x.c
++++ b/drivers/gpu/drm/bridge/sii902x.c
+@@ -181,6 +181,9 @@ struct sii902x {
+ 	struct gpio_desc *reset_gpio;
+ 	struct i2c_mux_core *i2cmux;
+ 	struct device_link *link;
++	unsigned int ctx_interrupt;
++	unsigned int ctx_audio_config;
++	bool d3_suspended;
+ 	u32 bus_width;
+ 
+ 	/*
+@@ -359,12 +362,30 @@ static void sii902x_bridge_atomic_disable(struct drm_bridge *bridge,
+ {
+ 	struct sii902x *sii902x = bridge_to_sii902x(bridge);
+ 
++	/* Save state before D3 Cold chip reset. */
++	regmap_read(sii902x->regmap, SII902X_INT_ENABLE, &sii902x->ctx_interrupt);
++	regmap_read(sii902x->regmap, SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
++		    &sii902x->ctx_audio_config);
++
+ 	mutex_lock(&sii902x->mutex);
+ 
+ 	regmap_update_bits(sii902x->regmap, SII902X_SYS_CTRL_DATA,
+ 			   SII902X_SYS_CTRL_PWR_DWN,
+ 			   SII902X_SYS_CTRL_PWR_DWN);
+ 
++	/* D3 Cold entry */
++	if (sii902x->reset_gpio) {
++		sii902x_clear_interrupts(sii902x);
++		sii902x_reset(sii902x);
++		regmap_write(sii902x->regmap, SII902X_REG_TPI_RQB, 0x0);
++		regmap_write(sii902x->regmap, SII902X_INT_ENABLE,
++			     SII902X_HOTPLUG_EVENT);
++		sii902x_clear_interrupts(sii902x);
++
++		sii902x->d3_suspended = true;
++		sii902x_set_power_state(sii902x, 3);
++	}
++
+ 	mutex_unlock(&sii902x->mutex);
+ }
+ 
+@@ -380,6 +401,31 @@ static void sii902x_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	u8 buf[10];
+ 	u16 pixel_clock_10kHz;
+ 
++	/* Full hardware init required after D3. */
++	if (sii902x->d3_suspended) {
++		int i;
++
++		sii902x->d3_suspended = false;
++		sii902x_reset(sii902x);
++		regmap_write(sii902x->regmap, SII902X_REG_TPI_RQB, 0x0);
++		regmap_write(sii902x->regmap, SII902X_INT_ENABLE,
++			     sii902x->ctx_interrupt);
++		sii902x_clear_interrupts(sii902x);
++
++		/* Restore audio hardware state lost on chip reset. */
++		if (sii902x->ctx_audio_config) {
++			for (i = 0; i < ARRAY_SIZE(sii902x->audio.i2s_fifo_sequence) &&
++				    sii902x->audio.i2s_fifo_sequence[i]; i++)
++				regmap_write(sii902x->regmap,
++					     SII902X_TPI_I2S_ENABLE_MAPPING_REG,
++					     sii902x->audio.i2s_fifo_sequence[i]);
++			sii902x_audio_decode_l0(sii902x);
++			regmap_write(sii902x->regmap,
++				     SII902X_TPI_AUDIO_CONFIG_BYTE2_REG,
++				     sii902x->ctx_audio_config);
++		}
++	}
++
+ 	connector = drm_atomic_get_new_connector_for_encoder(state, bridge->encoder);
+ 	if (!connector)
+ 		return;
+@@ -1132,17 +1178,26 @@ static irqreturn_t sii902x_interrupt(int irq, void *data)
+ 	struct sii902x *sii902x = data;
+ 	unsigned int status;
+ 
++	/*
++	 * I2C is off in D3 Cold. Report connected to trigger a full
++	 * detect cycle once the device is back in D0.
++	 */
++	if (sii902x->d3_suspended) {
++		if (sii902x->bridge.dev)
++			drm_bridge_hpd_notify(&sii902x->bridge,
++					      connector_status_connected);
++		return IRQ_HANDLED;
++	}
++
+ 	mutex_lock(&sii902x->mutex);
+ 	status = sii902x_clear_interrupts(sii902x);
+ 	mutex_unlock(&sii902x->mutex);
+ 
+-	if ((status & SII902X_HOTPLUG_EVENT) && sii902x->bridge.dev) {
+-		drm_helper_hpd_irq_event(sii902x->bridge.dev);
++	if ((status & SII902X_HOTPLUG_EVENT) && sii902x->bridge.dev)
+ 		drm_bridge_hpd_notify(&sii902x->bridge,
+ 				      (status & SII902X_PLUGGED_STATUS)
+ 					? connector_status_connected
+ 					: connector_status_disconnected);
+-	}
+ 
+ 	return IRQ_HANDLED;
+ }
+-- 
+2.43.0
+
